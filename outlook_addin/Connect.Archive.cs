@@ -249,7 +249,7 @@ namespace Axon.OutlookAddin
                 {
                     string yf = FindChild(sopDir, y.ToString(), false);
                     if (yf == null) continue;
-                    string cd = string.IsNullOrEmpty(company) ? null : FindChild(yf, company, false);
+                    string cd = string.IsNullOrEmpty(company) ? null : FindChild(yf, company, false, true);
                     string od = cd != null ? FindChild(cd, sap, false) : null;
                     if (od == null) od = FindDescendant(yf, sap, 4, sw, budgetMs);   // full search within the year
                     if (od != null) return od;
@@ -388,7 +388,7 @@ namespace Axon.OutlookAddin
                 {
                     // Genuinely not filed yet: propose a new folder under the detected country's current year.
                     yearDir = FindChild(sopDir, cy.ToString(), false);
-                    clientDir = (yearDir != null && !string.IsNullOrEmpty(company)) ? FindChild(yearDir, company, false) : null;
+                    clientDir = (yearDir != null && !string.IsNullOrEmpty(company)) ? FindChild(yearDir, company, false, true) : null;
                 }
                 dir = clientDir ?? yearDir ?? sopDir ?? codeDir ?? baseDir;
 
@@ -568,11 +568,18 @@ namespace Axon.OutlookAddin
             }
         }
 
+        // Which party folder the path sits in. Compared SEGMENT by segment, never as a substring: a
+        // supplier leaf like "MS\Mietzsch" begins with "\Mi", so a substring test for "\MI" reported it
+        // as internal — the folder was right but the word shown next to it in the picker was wrong.
         private static string PartyReason(string rel)
         {
-            return (rel.IndexOf("\\MC", StringComparison.OrdinalIgnoreCase) >= 0) ? "customer"
-                 : (rel.IndexOf("\\MI", StringComparison.OrdinalIgnoreCase) >= 0) ? "internal"
-                 : (rel.IndexOf("\\MS", StringComparison.OrdinalIgnoreCase) >= 0) ? "supplier" : "match";
+            foreach (var seg in (rel ?? "").Split('\\'))
+            {
+                if (string.Equals(seg, "MC", StringComparison.OrdinalIgnoreCase)) return "customer";
+                if (string.Equals(seg, "MI", StringComparison.OrdinalIgnoreCase)) return "internal";
+                if (string.Equals(seg, "MS", StringComparison.OrdinalIgnoreCase)) return "supplier";
+            }
+            return "match";
         }
 
         // Search the order number across EVERY country-code folder and its recent year folders. The email's
@@ -608,17 +615,47 @@ namespace Axon.OutlookAddin
         // then contains (all case-insensitive). One directory listing; null if none / dir unreadable.
         private static string FindChild(string dir, string needle, bool exactOnly)
         {
+            return FindChild(dir, needle, exactOnly, false);
+        }
+
+        // `loose` adds one more (lowest-priority) way to match, for COMPANY names only: the folder name is
+        // the start of the needle. The model reports a company's full legal name ("Carrier Europe S.A.",
+        // "Novetec BV") while the archive folder carries the short one ("Carrier", "Novetec"), so a
+        // folder-contains-needle test can never match and Download would propose a SECOND client folder
+        // beside the existing one. Compared on letters+digits only, so "4U Color s.r.o." still finds
+        // "4UColor". The longest such folder wins ("Carrier Europe" beats "Carrier"), and 3 characters is
+        // the floor so short acronym folders (AGC, CECO) still work without matching on noise.
+        private static string FindChild(string dir, string needle, bool exactOnly, bool loose)
+        {
             if (string.IsNullOrWhiteSpace(dir) || string.IsNullOrWhiteSpace(needle)) return null;
             string[] subs; try { subs = Directory.GetDirectories(dir); } catch { return null; }
-            string starts = null, contains = null;
+            string starts = null, contains = null, prefixOf = null;
+            string nk = loose ? NameKey(needle) : null;
             foreach (var s in subs)
             {
                 string n = Path.GetFileName(s);
                 if (string.Equals(n, needle, StringComparison.OrdinalIgnoreCase)) return s;
                 if (starts == null && n.StartsWith(needle, StringComparison.OrdinalIgnoreCase)) starts = s;
                 if (contains == null && n.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) contains = s;
+                if (loose)
+                {
+                    string fk = NameKey(n);
+                    if (fk.Length >= 3 && nk.Length > fk.Length && nk.StartsWith(fk, StringComparison.Ordinal)
+                        && (prefixOf == null || fk.Length > NameKey(Path.GetFileName(prefixOf)).Length))
+                        prefixOf = s;
+                }
             }
-            return exactOnly ? null : (starts ?? contains);
+            return exactOnly ? null : (starts ?? contains ?? prefixOf);
+        }
+
+        // A company name reduced to its letters and digits, lower-cased: "Carrier Europe S.A." ->
+        // "carriereuropesa". Lets folder and email spellings be compared without punctuation/spacing noise.
+        private static string NameKey(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new System.Text.StringBuilder(s.Length);
+            foreach (char c in s) if (char.IsLetterOrDigit(c)) sb.Append(char.ToLowerInvariant(c));
+            return sb.ToString();
         }
 
         // Bounded search for the first folder (within maxDepth of dir) whose name contains needle. Used
@@ -772,6 +809,34 @@ namespace Axon.OutlookAddin
             catch { }
         }
 
+        // A subject or attachment name turned into a filename Windows accepts. Illegal characters become
+        // spaces, then runs of whitespace collapse to ONE: dropping the colon of "FW: PE-14476-01-ADL"
+        // left the space that followed it, so the mail landed in the archive as "FW  PE-14476-01-ADL.msg".
+        private static string SafeFileName(string raw, string fallback)
+        {
+            string s = raw ?? "";
+            foreach (char c in Path.GetInvalidFileNameChars()) s = s.Replace(c, ' ');
+            s = System.Text.RegularExpressions.Regex.Replace(s, @"\s+", " ").Trim();
+            return s.Length == 0 ? fallback : s;
+        }
+
+        // A free path in `folder` for name+ext, appending " (n)" while the name is taken. The name is also
+        // shortened to what the 259-character path limit leaves: the Sales archive runs deep
+        // (T:\IF\Sales\AN\SOP\2026\<client>\<order>\MS\<supplier>), so a long subject could push the path
+        // past the limit and the whole save failed with "Couldn't save" — including the attachments.
+        // Trimmed AFTER cutting, so a name shortened at a space never leaves "subject .msg".
+        private static string UniquePath(string folder, string name, string ext)
+        {
+            int room = 259 - folder.TrimEnd('\\').Length - 1 - (ext ?? "").Length - 6;   // 6: room for " (99)"
+            if (name.Length > 120) name = name.Substring(0, 120);
+            if (room > 0 && name.Length > room) name = name.Substring(0, room);
+            name = name.TrimEnd();
+            if (name.Length == 0) name = "email";
+            string path = Path.Combine(folder, name + ext);
+            for (int i = 1; File.Exists(path); i++) path = Path.Combine(folder, name + " (" + i + ")" + ext);
+            return path;
+        }
+
         private void SaveEmailPerMode(dynamic mail, string folder, string subject, string mode)
         {
             try
@@ -780,15 +845,13 @@ namespace Axon.OutlookAddin
                 mode = (mode ?? "both").ToLowerInvariant();
                 bool saveMsg = mode == "both" || mode == "email";
                 bool saveAtt = mode == "both" || mode == "attachments";
+                string savedName = null;
+                int savedAtt = 0;
                 if (saveMsg)
                 {
-                    string name = string.IsNullOrEmpty(subject) ? "email" : subject;
-                    foreach (char c in Path.GetInvalidFileNameChars()) name = name.Replace(c, ' ');
-                    name = name.Trim(); if (name.Length == 0) name = "email"; if (name.Length > 120) name = name.Substring(0, 120);
-                    string path = Path.Combine(folder, name + ".msg");
-                    int i = 1;
-                    while (File.Exists(path)) { path = Path.Combine(folder, name + " (" + i + ").msg"); i++; }
+                    string path = UniquePath(folder, SafeFileName(subject, "email"), ".msg");
                     mail.SaveAs(path, 9);   // olMSGUnicode
+                    savedName = Path.GetFileName(path);
                 }
                 if (saveAtt)
                 {
@@ -804,20 +867,20 @@ namespace Axon.OutlookAddin
                                 bool hidden = false;
                                 try { hidden = (bool)att.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"); } catch { }
                                 if (hidden) continue;
-                                string an = (string)att.FileName;
-                                foreach (char c in Path.GetInvalidFileNameChars()) an = an.Replace(c, ' ');
-                                string ap = Path.Combine(folder, an);
-                                string bn = Path.GetFileNameWithoutExtension(ap), ex = Path.GetExtension(ap);
-                                int j = 1;
-                                while (File.Exists(ap)) { ap = Path.Combine(folder, bn + " (" + j + ")" + ex); j++; }
-                                att.SaveAsFile(ap);
+                                string an = SafeFileName((string)att.FileName, "attachment");
+                                att.SaveAsFile(UniquePath(folder, Path.GetFileNameWithoutExtension(an), Path.GetExtension(an)));
+                                savedAtt++;
                             }
                             catch { }
                         }
                     }
                     catch { }
                 }
-                Ui.Notify("Saved to:\n" + folder, "Axon intelligence");
+                // Name what actually landed, not just the folder — inline signature images are skipped, so
+                // "0 attachments" is normal and worth showing rather than leaving the user to wonder.
+                string what = savedName ?? "";
+                if (saveAtt) what += (what.Length > 0 ? "\n" : "") + savedAtt + " attachment" + (savedAtt == 1 ? "" : "s");
+                Ui.Notify("Saved to:\n" + folder + (what.Length > 0 ? "\n\n" + what : ""), "Axon intelligence");
             }
             catch (Exception ex) { Ui.Notify("Couldn't save: " + ex.Message, "Axon intelligence"); }
         }
@@ -827,14 +890,7 @@ namespace Axon.OutlookAddin
         {
             try
             {
-                string name = string.IsNullOrEmpty(subject) ? "email" : subject;
-                foreach (char c in Path.GetInvalidFileNameChars()) name = name.Replace(c, ' ');
-                name = name.Trim();
-                if (name.Length == 0) name = "email";
-                if (name.Length > 120) name = name.Substring(0, 120);
-                string path = Path.Combine(folder, name + ".msg");
-                int i = 1;
-                while (File.Exists(path)) { path = Path.Combine(folder, name + " (" + i + ").msg"); i++; }
+                string path = UniquePath(folder, SafeFileName(subject, "email"), ".msg");
                 mail.SaveAs(path, 9);   // 9 = olMSGUnicode
                 Ui.Notify("Saved to:\n" + path, "Axon intelligence");
             }
