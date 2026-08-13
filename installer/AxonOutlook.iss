@@ -6,7 +6,7 @@
 ; Output: installer\Output\Axon-Outlook-Setup.exe
 
 #define AppName     "Axon Outlook add-in"
-#define AppVersion  "1.0.0.5"
+#define AppVersion  "1.0.0.6"
 #define AppPublisher "Axon Group"
 #define AddinProgId "Axon.OutlookAddin"
 ; Keys for the add-in config.json, passed at build time (empty by default so the committed script

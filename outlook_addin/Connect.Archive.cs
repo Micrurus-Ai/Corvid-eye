@@ -240,8 +240,13 @@ namespace Axon.OutlookAddin
 
         // Locate the order folder for one candidate number: fast path under the detected country, then the
         // broad cross-country search. Returns null if that number isn't an order folder anywhere.
+        // `broadSearch` allows the expensive every-country scan. It is on for the first candidate, and OFF
+        // once a real order folder has already been located: the remaining candidates are usually digits
+        // scraped out of a reference (subject "[SQ-14349-126700361]" yields 14349 AND 126700), and letting
+        // each of those scan every country burnt most of the time budget for nothing — on a slow share that
+        // is what pushes the whole search past its deadline and reports "order not found".
         private string LocateOrder(string baseDir, string sopDir, string company, int cy, string sap,
-            System.Diagnostics.Stopwatch sw, int budgetMs)
+            System.Diagnostics.Stopwatch sw, int budgetMs, bool broadSearch)
         {
             if (string.IsNullOrEmpty(sap)) return null;
             if (sopDir != null)
@@ -254,7 +259,7 @@ namespace Axon.OutlookAddin
                     if (od == null) od = FindDescendant(yf, sap, 4, sw, budgetMs);   // full search within the year
                     if (od != null) return od;
                 }
-            return FindOrderAnywhere(baseDir, sap, cy, sw, budgetMs);
+            return broadSearch ? FindOrderAnywhere(baseDir, sap, cy, sw, budgetMs) : null;
         }
 
         private System.Collections.Generic.Dictionary<string, object> ExtractArchiveInfo(dynamic mail, ArchiveCfg cfg)
@@ -369,7 +374,7 @@ namespace Axon.OutlookAddin
                     foreach (var cand in saps)
                     {
                         if (sw.ElapsedMilliseconds > budgetMs) break;
-                        string od = LocateOrder(baseDir, sopDir, company, cy, cand, sw, budgetMs);
+                        string od = LocateOrder(baseDir, sopDir, company, cy, cand, sw, budgetMs, fallbackOrder == null);
                         if (od == null) continue;
                         if (fallbackOrder == null) { fallbackOrder = od; fallbackSap = cand; }
                         // No domain to check, or the correspondent's folder is inside this order -> take it now.
@@ -533,11 +538,29 @@ namespace Axon.OutlookAddin
                     if (hit != null) { chosenRel = hit; reason = PartyReason(hit); return; }
                 }
 
-                // 2) Party by the correspondent (not the sender): the customer -> MC, another external company
-                //    -> MS, nothing external -> MC (default; user can still choose MI).
+                // 2) Party by the correspondent (not the sender):
+                //    - a domain that IS the order's customer            -> MC
+                //    - no external domain at all, but an Axon one seen  -> MI (colleagues talking to each
+                //      other about the order; this is what "13109 - Trspt 2" is, and defaulting it to MC
+                //      put internal transport chatter in the customer folder)
+                //    - an external company we cannot tie to the customer -> DON'T GUESS. Calling it MS was
+                //      wrong for a price request from DEC Energies on an order filed under Bati-Energies:
+                //      a correspondent whose domain doesn't match the client folder is just as likely to be
+                //      the customer under another name as a supplier. Offer the order's Order/Quotation
+                //      level instead and let MC/MS sit in the list right below it.
                 bool custExternal = false, otherExternal = false;
                 foreach (var nm in labels) { if (isCust(nm)) custExternal = true; else otherExternal = true; }
-                string party = custExternal ? "MC" : (otherExternal ? "MS" : "MC");
+                string party;
+                if (custExternal) party = "MC";
+                else if (!otherExternal) party = HasInternalDomain(senderEmail, body) ? "MI" : "MC";
+                else party = null;
+
+                if (party == null)
+                {
+                    chosenRel = TypeFolderOf(orderRel, subfolders);
+                    reason = chosenRel == null ? null : "this order";
+                    return;
+                }
 
                 // Choose that party's folder; prefer the one under an 'Order' type branch (some orders nest
                 // MC/MI/MS under Order/Quote, others put them directly under the order).
@@ -555,6 +578,43 @@ namespace Axon.OutlookAddin
                 reason = party == "MC" ? "customer" : party == "MI" ? "internal" : "supplier";
             }
             catch { }
+        }
+
+        // The order's type level — the "Order" branch, else "Quotation" — used when the correspondent
+        // can't be pinned to a party and guessing MC vs MS would file the mail in the wrong place.
+        // Null when the order has no type level, and then the caller falls back to the order folder itself.
+        private static string TypeFolderOf(string orderRel, System.Collections.Generic.List<string> subfolders)
+        {
+            int want = orderRel.Split('\\').Length + 1;
+            string quote = null;
+            foreach (var rel in subfolders)
+            {
+                if (!rel.StartsWith(orderRel + "\\", StringComparison.OrdinalIgnoreCase)) continue;
+                if (rel.Split('\\').Length != want) continue;
+                string leaf = rel.Substring(rel.LastIndexOf('\\') + 1);
+                if (leaf.Equals("Order", StringComparison.OrdinalIgnoreCase)) return rel;
+                if (quote == null && (leaf.Equals("Quotation", StringComparison.OrdinalIgnoreCase)
+                                   || leaf.Equals("Quote", StringComparison.OrdinalIgnoreCase))) quote = rel;
+            }
+            return quote;
+        }
+
+        // True when the message carries at least one Axon Group address — the positive signal that the
+        // correspondents are colleagues. EmailDomainLabels deliberately drops internal domains, so its
+        // empty result cannot tell "internal conversation" from "no addresses in the text at all".
+        private static bool HasInternalDomain(string senderEmail, string body)
+        {
+            foreach (System.Text.RegularExpressions.Match mm in System.Text.RegularExpressions.Regex.Matches(
+                         (senderEmail ?? "") + " " + (body ?? ""), @"[\w.+\-]+@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})"))
+            {
+                string dm = mm.Groups[1].Value.ToLowerInvariant();
+                foreach (var id in InternalDomains.Split(','))
+                {
+                    string idt = id.Trim().ToLowerInvariant();
+                    if (idt.Length > 0 && dm.IndexOf(idt, StringComparison.Ordinal) >= 0) return true;
+                }
+            }
+            return false;
         }
 
         // Category folders that are structural, not company names — never treated as a supplier leaf.
