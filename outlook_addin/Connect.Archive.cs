@@ -227,11 +227,16 @@ namespace Axon.OutlookAddin
             // Most likely first: a number in an order-code context (after PE / SOP / Order / Bestelling).
             foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(s, @"\b(?:PE|SOP|order|bestelling|commande)\b[-\s:#nr\.]*0*(\d{4,6})", ic))
                 add(m.Groups[1].Value);
-            // Then the model's own guess, if it's a plain number.
-            if (!string.IsNullOrEmpty(aiSap) && System.Text.RegularExpressions.Regex.IsMatch(aiSap, @"^\d{4,6}$")) add(aiSap);
             // Then standalone numbers not glued to a letter (e.g. NOT the 24887 in 'm24887').
             foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(s, @"(?<![A-Za-z\d])(\d{4,6})(?![A-Za-z\d])"))
                 add(m.Groups[1].Value);
+            // ONLY THEN the model's own guess. It used to rank above the subject's own numbers, and that
+            // made the result unrepeatable: a subject like "Re: [SQ-14349-126700361] ..." carries no
+            // PE/SOP/order keyword, so whichever number the model returned became candidate #1 ahead of the
+            // 14349 printed in the subject. The model does not answer identically every time, so the same
+            // email could land on one order today and a different one on a retry. The subject is evidence;
+            // the model is a hint, and it now only breaks ties the subject cannot.
+            if (!string.IsNullOrEmpty(aiSap) && System.Text.RegularExpressions.Regex.IsMatch(aiSap, @"^\d{4,6}$")) add(aiSap);
             // Last resort: any 4-6 digit run at all (including letter-glued), so nothing is missed.
             foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(s, @"\d{4,6}"))
                 add(m.Value);

@@ -11,7 +11,7 @@ $ErrorActionPreference = "Stop"
 # Windows Installer compares only the FIRST THREE fields of the version. Because AllowSameVersionUpgrades
 # is on and every version gets its own ProductCode (below), bumping the 4th field alone (1.0.0.0 ->
 # 1.0.0.1) still upgrades cleanly — the new ProductCode is what makes MajorUpgrade replace the old one.
-$Version = "1.0.0.7"
+$Version = "1.0.0.8"
 
 # ProductCode derived from the version: SAME for every rebuild of a version (so an RMM's captured code
 # stays valid and uninstall-by-code never 1605s), DIFFERENT the moment the version changes (so the new
