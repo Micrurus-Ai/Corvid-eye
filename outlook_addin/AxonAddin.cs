@@ -69,10 +69,11 @@ namespace Axon.OutlookAddin
                    "<contextMenus>" + menus + "</contextMenus></customUI>";
         }
 
-        // An "Axon" group on the given built-in tab, laid out the way Office lays out its own groups:
-        // the two everyday actions as large buttons, a separator, then exactly three small buttons — a
-        // column holds three, so three fills it evenly instead of leaving a ragged gap — and Settings in
-        // the dialog box launcher, the corner arrow that is where Office puts a group's options.
+        // An "Axon" group on the given built-in tab. Every button is the same size — one small icon with
+        // its label beside it — so the group reads as one set rather than two. Office fills columns three
+        // at a time, and the separator splits it deliberately: the two everyday actions in the first
+        // column, the three that call the model in the second. Settings sits in the dialog box launcher,
+        // the corner arrow that is where Office puts a group's options.
         // No insertAfterMso — pinning the group beside a built-in one means a single idMso that is absent
         // in some Outlook build drops the whole customUI document, taking the right-click menu with it.
         // Button ids must be unique per tab, hence the suffix.
@@ -81,9 +82,9 @@ namespace Axon.OutlookAddin
             string s = tabMso;
             return "<ribbon><tabs><tab idMso='" + s + "'>" +
                    "<group id='axonGroup_" + s + "' label='Axon'>" +
-                   Btn("axonMove_r_" + s, "Move", "XM", "GetMoveImage", "OnFile", true,
+                   Btn("axonMove_r_" + s, "Move", "XM", "GetMoveImage", "OnFile", false,
                        "Move with Axon", "File this email in an Outlook folder. Axon suggests the folders you already file this sender in.") +
-                   Btn("axonDownload_r_" + s, "Download", "XD", "GetDownloadImage", "OnDownload", true,
+                   Btn("axonDownload_r_" + s, "Download", "XD", "GetDownloadImage", "OnDownload", false,
                        "Download with Axon", "Save this email to the Sales archive on disk, in the order folder it belongs to.") +
                    "<separator id='axonSep_r_" + s + "'/>" +
                    Btn("axonSummarize_r_" + s, "Summarize", "XS", "GetSummarizeImage", "OnSummarize", false,
