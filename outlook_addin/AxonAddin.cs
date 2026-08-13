@@ -172,7 +172,7 @@ namespace Axon.OutlookAddin
                 string[] folders = EnumerateInboxFolders();
                 if (folders.Length == 0)
                 {
-                    Ui.Notify("You have no Inbox subfolders yet. Create some folders to move emails into.", "Axon intelligence");
+                    Ui.Notify("No folders found to move emails into. Create a folder in Outlook first, then try again.", "Axon intelligence");
                     return;
                 }
                 string subject = ""; try { subject = (string)mail.Subject; } catch { }
@@ -215,6 +215,14 @@ namespace Axon.OutlookAddin
             new System.Collections.Generic.Dictionary<string, string>();
 
         // ALL folders under the Inbox, recursively, as display paths (in-process COM, fast).
+        // Every folder the user could file mail into. This used to list ONLY the subfolders of the default
+        // Inbox, so a mailbox that keeps its filing folders BESIDE the Inbox at the store root — Outlook's
+        // other perfectly normal layout — was told "You have no Inbox subfolders yet" while being full of
+        // folders. Order: the Inbox subtree first (display names unchanged, so filing history learned from
+        // SenderFolders still matches), then the rest of that mailbox, then any other open store (a shared
+        // mailbox, an online archive, a .pst) prefixed with its name.
+        private const int MaxFolders = 500;   // a shared mailbox can hold thousands; keep the picker usable
+
         private string[] EnumerateInboxFolders()
         {
             _folderMap = new System.Collections.Generic.Dictionary<string, string>();
@@ -222,25 +230,113 @@ namespace Axon.OutlookAddin
             try
             {
                 dynamic ns = ((dynamic)_app).GetNamespace("MAPI");
-                dynamic inbox = ns.GetDefaultFolder(6);   // olFolderInbox
-                CollectFolders(inbox, "", list, 0);
+
+                // Outlook's own folders, identified by id rather than by name so the check still holds on a
+                // Dutch or French Outlook (Postvak IN, Verwijderde items, ...). Deleted/Outbox/Sent/Drafts/
+                // Conflicts/Sync/Local+Server failures/Junk/RSS/To-Do are dead ends — neither offered nor
+                // descended into. The Inbox is a special case: it is not itself a filing target, but its
+                // subfolders are the usual ones, so we descend into it WITHOUT adding a level to the
+                // display path (which is what keeps names like "hr" identical to before).
+                // Each store is asked for its OWN defaults; ns.GetDefaultFolder only knows the main
+                // mailbox, which is why a second store used to offer its Deleted Items and Sync Issues.
+                // Matched on FolderPath, NOT EntryID: Outlook hands out short-term entry ids, so the id
+                // for a folder fetched via GetDefaultFolder does not necessarily equal the id for the same
+                // folder reached by walking Folders a moment later, and the skip silently missed. The path
+                // still comes from GetDefaultFolder rather than a hardcoded name, so it stays correct on a
+                // non-English Outlook.
+                var skipTree = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var skipSelf = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                Action<dynamic> addDefaults = store =>
+                {
+                    foreach (int id in new[] { 3, 4, 5, 16, 19, 20, 21, 22, 23, 25, 28 })
+                        try { skipTree.Add((string)store.GetDefaultFolder(id).FolderPath); } catch { }
+                    try { skipSelf.Add((string)store.GetDefaultFolder(6).FolderPath); } catch { }
+                };
+
+                string mainRoot = null;
+                try { mainRoot = (string)ns.GetDefaultFolder(6).Parent.EntryID; } catch { }
+                foreach (int id in new[] { 3, 4, 5, 16, 19, 20, 21, 22, 23, 25, 28 })
+                    try { skipTree.Add((string)ns.GetDefaultFolder(id).FolderPath); } catch { }
+                try { skipSelf.Add((string)ns.GetDefaultFolder(6).FolderPath); } catch { }
+
+                var roots = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, object>>();
+                try
+                {
+                    foreach (dynamic st in ns.Stores)
+                    {
+                        dynamic root; string rid;
+                        try { root = st.GetRootFolder(); rid = (string)root.EntryID; } catch { continue; }
+                        addDefaults(st);
+                        string nm = ""; try { nm = (string)st.DisplayName; } catch { }
+                        bool isMain = mainRoot != null && string.Equals(rid, mainRoot, StringComparison.OrdinalIgnoreCase);
+                        // The main mailbox contributes unprefixed names and goes first; other stores are
+                        // prefixed so "Inbox / Archive" and a shared mailbox's Archive stay tellable apart.
+                        var entry = new System.Collections.Generic.KeyValuePair<string, object>(isMain ? "" : (nm ?? ""), root);
+                        if (isMain) roots.Insert(0, entry); else roots.Add(entry);
+                    }
+                }
+                catch { }
+                if (roots.Count == 0)   // no store enumerable — fall back to just the Inbox subtree
+                    try { roots.Add(new System.Collections.Generic.KeyValuePair<string, object>("", ns.GetDefaultFolder(6).Parent)); } catch { }
+
+                foreach (var r in roots) CollectFolders(r.Value, r.Key, list, 0, skipTree, skipSelf);
             }
             catch { }
             return list.ToArray();
         }
 
-        private void CollectFolders(dynamic parent, string prefix, System.Collections.Generic.List<string> list, int depth)
+        // A folder mail can actually be moved into: it holds mail items, and it isn't one of Outlook's
+        // hidden bookkeeping folders (Working Set, Quick Step Settings, Yammer Root, Conversation Action
+        // Settings...) which are otherwise indistinguishable from ordinary folders. Both tests read MAPI
+        // properties rather than names, so they don't depend on Outlook's display language.
+        private static bool IsMailFolder(dynamic f)
         {
-            if (depth > 8) return;
+            try { if ((int)f.DefaultItemType != 0) return false; } catch { return false; }   // 0 = olMailItem
+            try { if ((bool)f.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x10F4000B")) return false; }
+            catch { }   // PR_ATTR_HIDDEN missing = not hidden
+            try
+            {
+                // PR_CONTAINER_CLASS: mail folders are "IPF.Note". Anything else set (IPF.Files,
+                // IPF.Configuration, IPF.Note.OutlookHomepage for RSS) is not a filing target. Unset is
+                // allowed through — some genuine folders carry no class.
+                string k = (string)f.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3613001F");
+                if (!string.IsNullOrEmpty(k) && !k.Equals("IPF.Note", StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            catch { }
+            return true;
+        }
+
+        private void CollectFolders(dynamic parent, string prefix, System.Collections.Generic.List<string> list,
+            int depth, System.Collections.Generic.HashSet<string> skipTree,
+            System.Collections.Generic.HashSet<string> skipSelf)
+        {
+            if (depth > 8 || list.Count >= MaxFolders) return;
             dynamic subs;
             try { subs = parent.Folders; } catch { return; }
             foreach (dynamic f in subs)
             {
+                if (list.Count >= MaxFolders) return;
+                string fpath = null; try { fpath = (string)f.FolderPath; } catch { }
+                if (fpath != null && skipTree != null && skipTree.Contains(fpath)) continue;   // dead end
+                if (fpath != null && skipSelf != null && skipSelf.Contains(fpath))
+                {   // the Inbox: not a target itself, but its subfolders are — and at THIS prefix level
+                    CollectFolders(f, prefix, list, depth, skipTree, skipSelf);
+                    continue;
+                }
+                string eid = null; try { eid = (string)f.EntryID; } catch { }
                 string name; try { name = (string)f.Name; } catch { continue; }
+                if (!IsMailFolder(f)) continue;
                 string disp = prefix == "" ? name : prefix + " / " + name;
-                try { _folderMap[disp] = (string)f.EntryID; } catch { }
+                // Two folders can now share a display name (Inbox\Archive and the root Archive). Keep both:
+                // the map is keyed by what the picker shows, so the second needs a distinct label.
+                if (_folderMap.ContainsKey(disp))
+                {
+                    string bas = disp;
+                    for (int n = 2; _folderMap.ContainsKey(disp); n++) disp = bas + " (" + n + ")";
+                }
+                if (eid != null) _folderMap[disp] = eid;
                 list.Add(disp);
-                CollectFolders(f, disp, list, depth + 1);   // recurse into nested subfolders
+                CollectFolders(f, disp, list, depth + 1, skipTree, skipSelf);   // nested subfolders
             }
         }
 
