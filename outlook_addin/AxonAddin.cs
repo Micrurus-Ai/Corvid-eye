@@ -46,21 +46,51 @@ namespace Axon.OutlookAddin
         // --- IRibbonExtensibility ---
         public string GetCustomUI(string RibbonID)
         {
-            // Axon lives ONLY in the right-click menu (no ribbon buttons). Add it to the menu you get
-            // on an email in the list, on multiple selected emails, and inside an open/previewed email.
+            // Axon is in the right-click menu AND, since right-click is an extra click on the actions
+            // people use all day, as a real button group on the mail Home tab and on an open message.
+            // A ribbon button is also what makes the Quick Access Toolbar possible: right-click the
+            // button -> "Add to Quick Access Toolbar" and Outlook gives it Alt+1..9 for free.
             if (RibbonID == "Microsoft.Outlook.Explorer")
-                return CtxUI(CtxMenu("ContextMenuMailItem") + CtxMenu("ContextMenuReadOnlyMailText"));
+                return CtxUI(MailRibbon("TabMail"),
+                             CtxMenu("ContextMenuMailItem") + CtxMenu("ContextMenuReadOnlyMailText"));
             if (RibbonID == "Microsoft.Outlook.Mail.Read")
-                return CtxUI(CtxMenu("ContextMenuReadOnlyMailText"));
+                return CtxUI(MailRibbon("TabReadMessage"), CtxMenu("ContextMenuReadOnlyMailText"));
             if (RibbonID == "Microsoft.Outlook.Mail.Compose")
                 return ComposeRibbon();   // compose body right-click is Word's, so use a ribbon button
             return null;
         }
 
-        private string CtxUI(string menus)
+        // customUI's schema fixes the child order: <ribbon> before <contextMenus>. Getting it wrong makes
+        // Office reject the WHOLE document, which would silently take the right-click menu with it.
+        private string CtxUI(string ribbon, string menus)
         {
             return "<customUI xmlns='http://schemas.microsoft.com/office/2009/07/customui'>" +
+                   (string.IsNullOrEmpty(ribbon) ? "" : ribbon) +
                    "<contextMenus>" + menus + "</contextMenus></customUI>";
+        }
+
+        // An "Axon" group on the given built-in tab: the two everyday actions large, the rest beside them.
+        // No insertAfterMso — pinning it next to a specific built-in group means an idMso that is wrong or
+        // absent in one Outlook build drops the entire ribbon, and the group is just as usable at the end.
+        // Button ids must be unique per tab, hence the suffix.
+        private string MailRibbon(string tabMso)
+        {
+            string s = tabMso;
+            return "<ribbon><tabs><tab idMso='" + s + "'>" +
+                   "<group id='axonGroup_" + s + "' label='Axon'>" +
+                   "<button id='axonMove_r_" + s + "' label='Move' size='large' keytip='XM' " +
+                   "screentip='Move with Axon' supertip='Pick the Outlook folder for this email, with suggestions.' " +
+                   "getImage='GetMoveImage' onAction='OnFile'/>" +
+                   "<button id='axonDownload_r_" + s + "' label='Download' size='large' keytip='XD' " +
+                   "screentip='Download with Axon' supertip='Save this email to the Sales archive on disk.' " +
+                   "getImage='GetDownloadImage' onAction='OnDownload'/>" +
+                   "<button id='axonSummarize_r_" + s + "' label='Summarize' keytip='XS' " +
+                   "getImage='GetSummarizeImage' onAction='OnSummarize'/>" +
+                   "<button id='axonReply_r_" + s + "' label='Reply' keytip='XR' " +
+                   "getImage='GetReplyImage' onAction='OnReply'/>" +
+                   "<button id='axonSettings_r_" + s + "' label='Settings' keytip='XG' " +
+                   "getImage='GetSettingsImage' onAction='OnSettings'/>" +
+                   "</group></tab></tabs></ribbon>";
         }
 
         // A small "Send Later" button in an Axon group on the compose Message tab (reliable — the
@@ -223,9 +253,18 @@ namespace Axon.OutlookAddin
         // mailbox, an online archive, a .pst) prefixed with its name.
         private const int MaxFolders = 500;   // a shared mailbox can hold thousands; keep the picker usable
 
+        // The subset of _folderMap that lives in the user's OWN mailbox. Ranking a folder means querying it
+        // (how many mails from this sender does it hold, what is in it lately), and that is a round trip
+        // per folder. In the main mailbox those hit the local cached copy; in a shared mailbox or an online
+        // archive they go to the server and cost hundreds of ms EACH, which is what makes the suggestions
+        // take "quite some time". Those folders stay in the picker — they are simply not probed.
+        private System.Collections.Generic.HashSet<string> _primaryFolders =
+            new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         private string[] EnumerateInboxFolders()
         {
             _folderMap = new System.Collections.Generic.Dictionary<string, string>();
+            _primaryFolders = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var list = new System.Collections.Generic.List<string>();
             try
             {
@@ -279,7 +318,14 @@ namespace Axon.OutlookAddin
                 if (roots.Count == 0)   // no store enumerable — fall back to just the Inbox subtree
                     try { roots.Add(new System.Collections.Generic.KeyValuePair<string, object>("", ns.GetDefaultFolder(6).Parent)); } catch { }
 
-                foreach (var r in roots) CollectFolders(r.Value, r.Key, list, 0, skipTree, skipSelf);
+                foreach (var r in roots)
+                {
+                    int before = list.Count;
+                    CollectFolders(r.Value, r.Key, list, 0, skipTree, skipSelf);
+                    // r.Key == "" is the main mailbox (it is the only root added unprefixed).
+                    if (r.Key.Length == 0)
+                        for (int i = before; i < list.Count; i++) _primaryFolders.Add(list[i]);
+                }
             }
             catch { }
             return list.ToArray();
@@ -406,6 +452,7 @@ namespace Axon.OutlookAddin
                 foreach (var kv in new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, string>>(_folderMap))
                 {
                     if (scanned >= 60) break;   // bound the scan
+                    if (!_primaryFolders.Contains(kv.Key)) continue;   // don't query other stores (slow)
                     scanned++;
                     try
                     {
@@ -451,6 +498,7 @@ namespace Axon.OutlookAddin
             {
                 sb.Append("- ").Append(path).Append("\n");
                 if (ns == null || sampled >= 40 || _folderMap == null || !_folderMap.ContainsKey(path)) continue;
+                if (!_primaryFolders.Contains(path)) continue;   // other stores: listed, not probed
                 sampled++;
                 try
                 {
