@@ -936,6 +936,20 @@ namespace Axon.OutlookAddin
                     }
                     catch { }
                 }
+                // Never claim success when the folder is still empty. With the save mode set to
+                // "Attachments only" no .msg is written at all, and an email whose only attachments are
+                // inline signature images (which are skipped on purpose) then produces NO file — while the
+                // old message still said "Saved to:". That is exactly how an email goes missing after the
+                // add-in reported it saved.
+                if (savedName == null && savedAtt == 0)
+                {
+                    Ui.Notify(saveMsg
+                        ? "Nothing was saved — this email produced no file."
+                        : "Nothing was saved.\n\nThe save mode is \"Attachments only\" and this email has no "
+                          + "attachments to save (inline signature images are skipped).\n\nChange it in "
+                          + "Settings if you meant to save the message itself.", "Axon intelligence");
+                    return;
+                }
                 // Name what actually landed, not just the folder — inline signature images are skipped, so
                 // "0 attachments" is normal and worth showing rather than leaving the user to wonder.
                 string what = savedName ?? "";
