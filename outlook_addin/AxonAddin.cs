@@ -69,28 +69,53 @@ namespace Axon.OutlookAddin
                    "<contextMenus>" + menus + "</contextMenus></customUI>";
         }
 
-        // An "Axon" group on the given built-in tab: the two everyday actions large, the rest beside them.
-        // No insertAfterMso — pinning it next to a specific built-in group means an idMso that is wrong or
-        // absent in one Outlook build drops the entire ribbon, and the group is just as usable at the end.
+        // An "Axon" group on the given built-in tab, laid out the way Office lays out its own groups:
+        // the two everyday actions as large buttons, a separator, then exactly three small buttons — a
+        // column holds three, so three fills it evenly instead of leaving a ragged gap — and Settings in
+        // the dialog box launcher, the corner arrow that is where Office puts a group's options.
+        // No insertAfterMso — pinning the group beside a built-in one means a single idMso that is absent
+        // in some Outlook build drops the whole customUI document, taking the right-click menu with it.
         // Button ids must be unique per tab, hence the suffix.
         private string MailRibbon(string tabMso)
         {
             string s = tabMso;
             return "<ribbon><tabs><tab idMso='" + s + "'>" +
                    "<group id='axonGroup_" + s + "' label='Axon'>" +
-                   "<button id='axonMove_r_" + s + "' label='Move' size='large' keytip='XM' " +
-                   "screentip='Move with Axon' supertip='Pick the Outlook folder for this email, with suggestions.' " +
-                   "getImage='GetMoveImage' onAction='OnFile'/>" +
-                   "<button id='axonDownload_r_" + s + "' label='Download' size='large' keytip='XD' " +
-                   "screentip='Download with Axon' supertip='Save this email to the Sales archive on disk.' " +
-                   "getImage='GetDownloadImage' onAction='OnDownload'/>" +
-                   "<button id='axonSummarize_r_" + s + "' label='Summarize' keytip='XS' " +
-                   "getImage='GetSummarizeImage' onAction='OnSummarize'/>" +
-                   "<button id='axonReply_r_" + s + "' label='Reply' keytip='XR' " +
-                   "getImage='GetReplyImage' onAction='OnReply'/>" +
-                   "<button id='axonSettings_r_" + s + "' label='Settings' keytip='XG' " +
-                   "getImage='GetSettingsImage' onAction='OnSettings'/>" +
+                   Btn("axonMove_r_" + s, "Move", "XM", "GetMoveImage", "OnFile", true,
+                       "Move with Axon", "File this email in an Outlook folder. Axon suggests the folders you already file this sender in.") +
+                   Btn("axonDownload_r_" + s, "Download", "XD", "GetDownloadImage", "OnDownload", true,
+                       "Download with Axon", "Save this email to the Sales archive on disk, in the order folder it belongs to.") +
+                   "<separator id='axonSep_r_" + s + "'/>" +
+                   Btn("axonSummarize_r_" + s, "Summarize", "XS", "GetSummarizeImage", "OnSummarize", false,
+                       "Summarize with Axon", "Read the whole thread and write a short summary of it.") +
+                   Btn("axonReply_r_" + s, "Reply", "XR", "GetReplyImage", "OnReply", false,
+                       "Reply with Axon", "Draft a reply in your own tone, ready for you to check and send.") +
+                   Btn("axonSchedule_r_" + s, "Schedule", "XC", "GetScheduleImage", "OnSchedule", false,
+                       "Schedule with Axon", "Turn this email into a meeting or an appointment.") +
+                   "<dialogBoxLauncher>" +
+                   "<button id='axonSettings_r_" + s + "' keytip='XG' screentip='Axon settings' " +
+                   "supertip='Archive folders, what Download saves, and the country codes.' onAction='OnSettings'/>" +
+                   "</dialogBoxLauncher>" +
                    "</group></tab></tabs></ribbon>";
+        }
+
+        // One ribbon button. Every button carries a screentip and supertip: the hover card with a bold
+        // title and a sentence under it is most of what makes a group read as finished rather than homemade.
+        private static string Btn(string id, string label, string keytip, string image, string action,
+                                  bool large, string tip, string superTip)
+        {
+            return "<button id='" + id + "' label='" + label + "' keytip='" + keytip + "'" +
+                   (large ? " size='large'" : "") +
+                   " screentip='" + Xml(tip) + "' supertip='" + Xml(superTip) + "'" +
+                   " getImage='" + image + "' onAction='" + action + "'/>";
+        }
+
+        // Attribute values are single-quoted above, so anything quotable has to be escaped or the whole
+        // customUI document fails to parse and Office silently shows none of it.
+        private static string Xml(string s)
+        {
+            return (s ?? "").Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+                            .Replace("'", "&apos;").Replace("\"", "&quot;");
         }
 
         // A small "Send Later" button in an Axon group on the compose Message tab (reliable — the
