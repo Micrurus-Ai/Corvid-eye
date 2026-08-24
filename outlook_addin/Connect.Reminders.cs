@@ -1,4 +1,4 @@
-// Axon Outlook add-in — In-Outlook Follow-up / Send-Later reminder service.  (partial of Connect; split out of AxonAddin.cs.)
+﻿// Axon Outlook add-in — In-Outlook Follow-up / Send-Later reminder service.  (partial of Connect; split out of AxonAddin.cs.)
 using System;
 using System.IO;
 using System.Reflection;
@@ -44,7 +44,7 @@ namespace Axon.OutlookAddin
 
         private static string AxonDir()
         {
-            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AxonOutlook");
+            return AxonDataDir();
         }
 
         private static System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object>> LoadArray(string path)

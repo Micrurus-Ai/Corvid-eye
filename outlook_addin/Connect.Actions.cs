@@ -1,4 +1,4 @@
-// Axon Outlook add-in — Ribbon actions: Summarize, Reply, Schedule, Attach, Write, Send Later, Follow up.  (partial of Connect; split out of AxonAddin.cs.)
+﻿// Axon Outlook add-in — Ribbon actions: Summarize, Reply, Schedule, Attach, Write, Send Later, Follow up.  (partial of Connect; split out of AxonAddin.cs.)
 using System;
 using System.IO;
 using System.Reflection;
@@ -194,8 +194,7 @@ namespace Axon.OutlookAddin
         {
             try
             {
-                string p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                                        "AxonOutlook", "tone.txt");
+                string p = Path.Combine(AxonDataDir(), "tone.txt");
                 if (File.Exists(p)) { string s = File.ReadAllText(p).Trim(); if (s.Length > 0) return s; }
             }
             catch { }
@@ -784,7 +783,7 @@ namespace Axon.OutlookAddin
                 if (string.IsNullOrEmpty(who)) { try { who = (string)mail.To; } catch { } }
                 string topic = ""; try { topic = (string)mail.ConversationTopic; } catch { }
 
-                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AxonOutlook");
+                string dir = AxonDataDir();
                 Directory.CreateDirectory(dir);
                 string path = Path.Combine(dir, "followups.json");
                 var js = new System.Web.Script.Serialization.JavaScriptSerializer();
@@ -808,7 +807,7 @@ namespace Axon.OutlookAddin
         {
             try
             {
-                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AxonOutlook");
+                string dir = AxonDataDir();
                 Directory.CreateDirectory(dir);
                 string path = Path.Combine(dir, "scheduled.json");
                 var js = new System.Web.Script.Serialization.JavaScriptSerializer();

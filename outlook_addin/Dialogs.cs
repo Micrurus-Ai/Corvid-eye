@@ -1,4 +1,4 @@
-// Axon Outlook add-in — WinForms dialog classes (moved out of AxonAddin.cs to keep it lean).
+﻿// Axon Outlook add-in — WinForms dialog classes (moved out of AxonAddin.cs to keep it lean).
 using System;
 using System.IO;
 using System.Reflection;
@@ -19,6 +19,8 @@ namespace Axon.OutlookAddin
         private TextBox _tone;
         private ComboBox _mode;
         private Button _learn;
+        private Button _relearn;
+        private Label _folderHint;
 
         public SettingsForm(Connect owner)
         {
@@ -40,7 +42,7 @@ namespace Axon.OutlookAddin
 
         private void BuildPremiumUi()
         {
-            ClientSize = new System.Drawing.Size(560, 470);
+            ClientSize = new System.Drawing.Size(560, 590);   // +120 for the Folders card below Writing tone
             BackColor = SettingsBg;
             int W = ClientSize.Width, x = 24, lw = W - 48;
 
@@ -67,6 +69,17 @@ namespace Axon.OutlookAddin
             _learn = SettingsGhostButton("Learn from my Sent emails", 18, 140, 210, 28);
             _learn.Click += (o, e) => LearnTone();
             writing.Controls.Add(_learn);
+
+            // Move reads its folder list from disk and refreshes it behind the dialog, so this is only for
+            // "I just made a folder and want it in the list now" rather than something anyone must remember.
+            var foldersCard = SettingsCard(x, 404, lw, 104);
+            Controls.Add(foldersCard);
+            foldersCard.Controls.Add(SettingsSectionTitle("Folders", 18, 16, lw - 36));
+            _folderHint = SettingsHint("Move remembers your folders so the list opens instantly. It refreshes itself; use this if you just made one.", 18, 42, lw - 36, 30);
+            foldersCard.Controls.Add(_folderHint);
+            _relearn = SettingsGhostButton("Learn my folders", 18, 70, 210, 28);
+            _relearn.Click += (o, e) => RelearnFolders();
+            foldersCard.Controls.Add(_relearn);
 
             Controls.Add(SettingsHint("Changes apply after saving.", x, ClientSize.Height - 58, 220, 20));
             var save = SettingsPrimaryButton("Save", W - 24 - 96, ClientSize.Height - 54, 96, 34);
@@ -135,7 +148,7 @@ namespace Axon.OutlookAddin
             return b;
         }
 
-        private static string Dir() { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AxonOutlook"); }
+        private static string Dir() { return Connect.AxonDataDir(); }
         private static string Get(System.Collections.Generic.Dictionary<string, object> d, string k) { object v; return (d != null && d.TryGetValue(k, out v) && v != null) ? v.ToString() : ""; }
         private static TextBox Tb(int x, int y, int w) { return new TextBox { Left = x, Top = y, Width = w, BorderStyle = BorderStyle.FixedSingle }; }
         private static Label Lbl(string t, int x, int y) { return new Label { Text = t, Left = x, Top = y, Width = 510, Height = 16, ForeColor = System.Drawing.Color.FromArgb(80, 80, 80) }; }
@@ -184,6 +197,34 @@ namespace Axon.OutlookAddin
                 File.WriteAllText(Path.Combine(Dir(), "tone.txt"), (_tone.Text ?? "").Trim());
             }
             catch (Exception ex) { Ui.Notify("Couldn't save settings: " + ex.Message, "Axon intelligence"); }
+        }
+
+        // Walking the stores takes seconds on a mailbox with shared boxes attached, so it runs off the UI
+        // thread and the button says what it is doing rather than freezing the settings window.
+        private void RelearnFolders()
+        {
+            _relearn.Enabled = false;
+            string was = _relearn.Text;
+            _relearn.Text = "Reading your folders…";
+            var t = new System.Threading.Thread(() =>
+            {
+                string msg;
+                try { msg = _owner.RelearnFolders(); }
+                catch (Exception ex) { msg = "Couldn't read the folders: " + ex.Message; }
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        _folderHint.Text = msg;
+                        _relearn.Text = was;
+                        _relearn.Enabled = true;
+                    }));
+                }
+                catch { }
+            });
+            t.IsBackground = true;
+            t.SetApartmentState(System.Threading.ApartmentState.STA);
+            t.Start();
         }
 
         private void LearnTone()

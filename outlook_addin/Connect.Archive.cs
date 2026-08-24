@@ -18,8 +18,7 @@ namespace Axon.OutlookAddin
         // --- archive memory: remember where each client's emails were last filed -----------------
         private static string ArchiveMemPath()
         {
-            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                                "AxonOutlook", "archive_memory.json");
+            return Path.Combine(AxonDataDir(), "archive_memory.json");
         }
 
         private System.Collections.Generic.Dictionary<string, object> ReadArchiveMemory()
@@ -106,6 +105,11 @@ namespace Axon.OutlookAddin
                         string sender = ""; try { sender = (string)mail.SenderName; } catch { }
                         string senderEmail = ""; try { senderEmail = (string)mail.SenderEmailAddress; } catch { }
                         string body = ""; try { body = (string)mail.Body; } catch { }
+                        // The addresses the message carries in its FIELDS, appended so the domain scan can
+                        // see them. Without this it read only the sender and the body text, so a mail you
+                        // SENT to a supplier — whose address is in the To field and nowhere else — showed no
+                        // external domain at all, and the supplier's own folder (…\MS\WEG) was never offered.
+                        body += MessageAddresses(mail);
                         string baseDir = ResolveBaseDir(cfg, category, code);
                         _archiveBaseDir = baseDir;
                         _archiveCompany = company;
@@ -168,8 +172,7 @@ namespace Axon.OutlookAddin
             var cfg = new ArchiveCfg();
             try
             {
-                string p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                                        "AxonOutlook", "archive.json");
+                string p = Path.Combine(AxonDataDir(), "archive.json");
                 if (!File.Exists(p)) return cfg;
                 var js = new System.Web.Script.Serialization.JavaScriptSerializer();
                 var d = js.DeserializeObject(File.ReadAllText(p)) as System.Collections.Generic.Dictionary<string, object>;
@@ -874,6 +877,81 @@ namespace Axon.OutlookAddin
             catch { }
         }
 
+        // Every address the message itself carries: the sender in SMTP form, and every To/CC recipient.
+        // Outlook reports an internal sender and internal recipients as X.500 strings with no domain in
+        // them, so each one is asked for its SMTP address (PR_SENT_REPRESENTING_SMTP_ADDRESS /
+        // PR_SMTP_ADDRESS) before falling back to what the object shows directly.
+        private static string MessageAddresses(dynamic mail)
+        {
+            var sb = new System.Text.StringBuilder();
+            Action<string> add = a => { if (!string.IsNullOrEmpty(a) && a.IndexOf('@') > 0) sb.Append(' ').Append(a); };
+            try { add((string)mail.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x5D01001F")); } catch { }
+            try { add((string)mail.SenderEmailAddress); } catch { }
+            try
+            {
+                foreach (dynamic r in mail.Recipients)
+                {
+                    string a = null;
+                    try { a = (string)r.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x39FE001F"); } catch { }
+                    if (string.IsNullOrEmpty(a)) { try { a = (string)r.Address; } catch { } }
+                    add(a);
+                }
+            }
+            catch { }
+            return sb.ToString();
+        }
+
+        // The archive names every filed message "<R|S>-<yymmdd>-<subject>": R for one that came to you, S
+        // for one you sent, then the date it was sent or received. Matches how the team already files by
+        // hand, so Axon's files sort in with theirs instead of forming a separate set.
+        private string MailFilePrefix(dynamic mail)
+        {
+            try
+            {
+                bool sent = IsFromMe(mail);
+                DateTime when = DateTime.MinValue;
+                if (sent) { try { when = (DateTime)mail.SentOn; } catch { } }
+                else { try { when = (DateTime)mail.ReceivedTime; } catch { } }
+                if (when == DateTime.MinValue) { try { when = (DateTime)mail.SentOn; } catch { } }
+                if (when == DateTime.MinValue) { try { when = (DateTime)mail.ReceivedTime; } catch { } }
+                if (when == DateTime.MinValue) return "";
+                return (sent ? "S-" : "R-") + when.ToString("yyMMdd", System.Globalization.CultureInfo.InvariantCulture) + "-";
+            }
+            catch { return ""; }
+        }
+
+        // Did this mailbox's owner send it? Both sides are collected in BOTH forms and compared as sets,
+        // because which form is populated varies per message: an internal sender's SenderEmailAddress is an
+        // X.500 path, and PR_SENT_REPRESENTING_SMTP_ADDRESS — the SMTP counterpart — is simply EMPTY on
+        // some sent items. Comparing one form against the other labelled real sent mail as received.
+        // Sitting in Sent Items is the final signal, matched on FolderPath since entry ids are not stable.
+        private bool IsFromMe(dynamic mail)
+        {
+            try
+            {
+                dynamic ns = ((dynamic)_app).GetNamespace("MAPI");
+                var mine = new System.Collections.Generic.List<string>();
+                try { mine.Add((string)ns.CurrentUser.AddressEntry.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x39FE001F")); } catch { }
+                try { mine.Add((string)ns.CurrentUser.Address); } catch { }
+                var his = new System.Collections.Generic.List<string>();
+                try { his.Add((string)mail.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x5D01001F")); } catch { }
+                try { his.Add((string)mail.SenderEmailAddress); } catch { }
+                foreach (var a in mine)
+                    foreach (var b in his)
+                        if (!string.IsNullOrWhiteSpace(a) && !string.IsNullOrWhiteSpace(b)
+                            && string.Equals(a.Trim(), b.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+                try
+                {
+                    string here = (string)mail.Parent.FolderPath;
+                    string sent = (string)ns.GetDefaultFolder(5).FolderPath;   // olFolderSentMail
+                    if (!string.IsNullOrEmpty(here) && string.Equals(here, sent, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                catch { }
+            }
+            catch { }
+            return false;
+        }
+
         // A subject or attachment name turned into a filename Windows accepts. Illegal characters become
         // spaces, then runs of whitespace collapse to ONE: dropping the colon of "FW: PE-14476-01-ADL"
         // left the space that followed it, so the mail landed in the archive as "FW  PE-14476-01-ADL.msg".
@@ -914,7 +992,7 @@ namespace Axon.OutlookAddin
                 int savedAtt = 0;
                 if (saveMsg)
                 {
-                    string path = UniquePath(folder, SafeFileName(subject, "email"), ".msg");
+                    string path = UniquePath(folder, MailFilePrefix(mail) + SafeFileName(subject, "email"), ".msg");
                     mail.SaveAs(path, 9);   // olMSGUnicode
                     savedName = Path.GetFileName(path);
                 }
@@ -969,19 +1047,44 @@ namespace Axon.OutlookAddin
         {
             try
             {
-                string path = UniquePath(folder, SafeFileName(subject, "email"), ".msg");
+                string path = UniquePath(folder, MailFilePrefix(mail) + SafeFileName(subject, "email"), ".msg");
                 mail.SaveAs(path, 9);   // 9 = olMSGUnicode
                 Ui.Notify("Saved to:\n" + path, "Axon intelligence");
             }
             catch (Exception ex) { Ui.Notify("Couldn't save: " + ex.Message, "Axon intelligence"); }
         }
 
-        // The user's configured save-folders (disk paths) live in %APPDATA%\AxonIntelligence.
+        // The user's configured save-folders (disk paths). These used to live in %APPDATA%\AxonIntelligence
+        // — the DOT app's folder, from when the add-in shipped alongside it — which meant the add-in wrote
+        // per-user state into two different places, and uninstall (which clears %APPDATA%\AxonOutlook across
+        // every profile) left this one behind on every machine. Everything the add-in learns now lives in
+        // %APPDATA%\AxonOutlook. An existing file is carried across the first time, so nobody's list is lost.
         private static string DownloadConfigPath()
         {
-            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AxonIntelligence");
+            string dir = AxonDataDir();
+            string path = Path.Combine(dir, "download_folders.json");
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    string old = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                                              "AxonIntelligence", "download_folders.json");
+                    // Move, not copy: leaving the old one behind recreates the very mess this removes. Only
+                    // this one file — AxonIntelligence is the dot app's own folder and its files stay put.
+                    if (File.Exists(old)) { File.Copy(old, path, true); try { File.Delete(old); } catch { } }
+                }
+            }
+            catch { }
+            return path;
+        }
+
+        // The one place the add-in keeps everything it learns for a user: the folder cache, archive memory,
+        // learned tone, reminders and settings. %APPDATA%\AxonOutlook, which uninstall clears.
+        internal static string AxonDataDir()
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AxonOutlook");
             try { Directory.CreateDirectory(dir); } catch { }
-            return Path.Combine(dir, "download_folders.json");
+            return dir;
         }
 
         private System.Collections.Generic.List<string> LoadDownloadFolders()

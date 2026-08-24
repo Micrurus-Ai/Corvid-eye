@@ -225,7 +225,15 @@ namespace Axon.OutlookAddin
                 object m = GetSelectedMail();
                 if (m == null) { Ui.Notify("Select an email first.", "Axon intelligence"); return; }
                 dynamic mail = m;
-                string[] folders = EnumerateInboxFolders();
+                // Walking every store to list the folders costs 1-5 seconds and used to happen HERE, before
+                // the dialog could appear, on every single click. The list is now read from disk instead and
+                // refreshed behind the open dialog, so the wait is paid once rather than every time.
+                string[] folders = LoadFolderCache();
+                if (folders.Length == 0)
+                {
+                    folders = EnumerateInboxFolders();   // first ever use: nothing cached yet
+                    SaveFolderCache();
+                }
                 if (folders.Length == 0)
                 {
                     Ui.Notify("No folders found to move emails into. Create a folder in Outlook first, then try again.", "Axon intelligence");
@@ -245,6 +253,22 @@ namespace Axon.OutlookAddin
                 });
                 worker.IsBackground = true;
                 worker.Start();
+                // Separately, re-walk the stores behind the dialog and refresh both the cache and the list
+                // the user is looking at. A folder added in Outlook shows up as soon as this lands, so the
+                // cache never needs a TTL and nobody has to remember to press anything. It runs apart from
+                // the suggestions thread so a slow walk cannot hold the suggestions back.
+                var refresh = new System.Threading.Thread(() =>
+                {
+                    try
+                    {
+                        var fresh = EnumerateInboxFolders();
+                        SaveFolderCache();
+                        if (fresh.Length > 0) dlg.SetFolders(fresh);
+                    }
+                    catch { }
+                });
+                refresh.IsBackground = true;
+                refresh.Start();
                 try
                 {
                     if (dlg.ShowDialog() == DialogResult.OK)
@@ -289,7 +313,10 @@ namespace Axon.OutlookAddin
 
         private string[] EnumerateInboxFolders()
         {
+            // Built into fresh dictionaries and only published at the end, so the refresh running behind an
+            // open dialog can never be seen half-written by the suggestion thread reading these.
             _folderMap = new System.Collections.Generic.Dictionary<string, string>();
+            _folderPaths = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             _primaryFolders = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var list = new System.Collections.Generic.List<string>();
             try
@@ -407,24 +434,180 @@ namespace Axon.OutlookAddin
                     for (int n = 2; _folderMap.ContainsKey(disp); n++) disp = bas + " (" + n + ")";
                 }
                 if (eid != null) _folderMap[disp] = eid;
+                if (fpath != null) _folderPaths[disp] = fpath;
                 list.Add(disp);
                 CollectFolders(f, disp, list, depth + 1, skipTree, skipSelf);   // nested subfolders
             }
         }
 
-        // Move the email into the chosen folder (looked up by EntryID from its display path).
+        // Where the learned folder list lives between Outlook sessions.
+        private static string FolderCachePath()
+        {
+            return Path.Combine(AxonDataDir(), "folders.json");
+        }
+
+        // Display path -> the folder's FolderPath ("\\mailbox\Inbox\hr"). Kept ALONGSIDE the EntryID map
+        // because entry ids are not dependable across enumerations, let alone across sessions: the id for a
+        // folder fetched one way did not match the id for the same folder reached another way, which is what
+        // silently broke the skip list earlier. FolderPath is derived from names and stays put, so it is the
+        // key that survives being written to disk; the EntryID is only ever the fast path.
+        private System.Collections.Generic.Dictionary<string, string> _folderPaths =
+            new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        private string[] LoadFolderCache()
+        {
+            try
+            {
+                string p = FolderCachePath();
+                if (!File.Exists(p)) return new string[0];
+                var js = new System.Web.Script.Serialization.JavaScriptSerializer();
+                var d = js.DeserializeObject(File.ReadAllText(p)) as System.Collections.Generic.Dictionary<string, object>;
+                var arr = d != null && d.ContainsKey("folders") ? d["folders"] as object[] : null;
+                if (arr == null) return new string[0];
+                var map = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var paths = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var prim = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var list = new System.Collections.Generic.List<string>();
+                foreach (var o in arr)
+                {
+                    var e = o as System.Collections.Generic.Dictionary<string, object>;
+                    if (e == null || !e.ContainsKey("n") || e["n"] == null) continue;
+                    string n = e["n"].ToString();
+                    if (map.ContainsKey(n)) continue;
+                    map[n] = e.ContainsKey("id") && e["id"] != null ? e["id"].ToString() : "";
+                    paths[n] = e.ContainsKey("p") && e["p"] != null ? e["p"].ToString() : "";
+                    if (e.ContainsKey("m") && e["m"] != null && e["m"].ToString() == "1") prim.Add(n);
+                    list.Add(n);
+                }
+                if (list.Count == 0) return new string[0];
+                _folderMap = map; _folderPaths = paths; _primaryFolders = prim;
+                return list.ToArray();
+            }
+            catch { }
+            return new string[0];
+        }
+
+        private void SaveFolderCache()
+        {
+            try
+            {
+                var map = _folderMap; var paths = _folderPaths; var prim = _primaryFolders;
+                if (map == null || map.Count == 0) return;
+                var sb = new System.Text.StringBuilder("{\"folders\":[");
+                bool first = true;
+                foreach (var kv in map)
+                {
+                    string path; if (paths == null || !paths.TryGetValue(kv.Key, out path)) path = "";
+                    if (!first) sb.Append(",");
+                    first = false;
+                    sb.Append("{\"n\":").Append(JsStr(kv.Key))
+                      .Append(",\"p\":").Append(JsStr(path))
+                      .Append(",\"id\":").Append(JsStr(kv.Value))
+                      .Append(",\"m\":\"").Append(prim != null && prim.Contains(kv.Key) ? "1" : "0").Append("\"}");
+                }
+                sb.Append("]}");
+                File.WriteAllText(FolderCachePath(), sb.ToString(), new System.Text.UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        private static string JsStr(string s)
+        {
+            var sb = new System.Text.StringBuilder("\"");
+            foreach (char c in s ?? "")
+            {
+                if (c == '"' || c == '\\') sb.Append('\\').Append(c);
+                else if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
+                else sb.Append(c);
+            }
+            return sb.Append('"').ToString();
+        }
+
+        // Re-walk the stores now and write the result to disk. Behind the Settings button, for anyone who
+        // just made a folder and wants it immediately instead of after the next Move.
+        public string RelearnFolders()
+        {
+            var folders = EnumerateInboxFolders();
+            SaveFolderCache();
+            int stores = 1;
+            try
+            {
+                var seen = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in _folderPaths)
+                {
+                    string p = kv.Value ?? "";
+                    int i = p.StartsWith("\\\\") ? p.IndexOf('\\', 2) : -1;
+                    if (i > 0) seen.Add(p.Substring(2, i - 2));
+                }
+                if (seen.Count > 0) stores = seen.Count;
+            }
+            catch { }
+            return folders.Length == 0
+                ? "No folders found."
+                : "Learned " + folders.Length + " folder" + (folders.Length == 1 ? "" : "s")
+                  + " across " + stores + " mailbox" + (stores == 1 ? "" : "es") + ".";
+        }
+
+        // The folder behind a display path: its EntryID first, and if that no longer resolves — a cached id
+        // from an earlier session, a folder since moved — walk the FolderPath instead.
+        private dynamic ResolveFolder(dynamic ns, string display)
+        {
+            string eid;
+            if (_folderMap != null && _folderMap.TryGetValue(display, out eid) && !string.IsNullOrEmpty(eid))
+            { try { dynamic f = ns.GetFolderFromID(eid); if (f != null) return f; } catch { } }
+            string path;
+            if (_folderPaths != null && _folderPaths.TryGetValue(display, out path) && !string.IsNullOrEmpty(path))
+            { try { return FolderByPath(ns, path); } catch { } }
+            return null;
+        }
+
+        // "\\Mailbox name\Inbox\hr" -> the folder, by walking names from that store's root.
+        // A folder whose own name contains a slash comes back from Outlook with it escaped — the real
+        // folder "Energy Efficiency / Training Materials" appears in FolderPath as
+        // "Energy Efficiency %2F Training Materials" — so each segment has to be decoded before it is
+        // compared with Folder.Name, or that folder is never found. Only %2F is decoded: running the
+        // segment through a general URL-unescape would mangle any name with a literal % in it.
+        private static dynamic FolderByPath(dynamic ns, string path)
+        {
+            string p = (path ?? "").TrimStart('\\');
+            var segs = p.Split('\\');
+            for (int i = 0; i < segs.Length; i++)
+                segs[i] = System.Text.RegularExpressions.Regex.Replace(segs[i], "%2F", "/",
+                              System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (segs.Length < 1) return null;
+            dynamic root = null;
+            foreach (dynamic st in ns.Stores)
+            {
+                string nm = ""; try { nm = (string)st.DisplayName; } catch { }
+                if (string.Equals(nm, segs[0], StringComparison.OrdinalIgnoreCase))
+                { try { root = st.GetRootFolder(); } catch { } break; }
+            }
+            if (root == null) return null;
+            dynamic cur = root;
+            for (int i = 1; i < segs.Length; i++)
+            {
+                dynamic next = null;
+                foreach (dynamic f in cur.Folders)
+                {
+                    string n = ""; try { n = (string)f.Name; } catch { }
+                    if (string.Equals(n, segs[i], StringComparison.OrdinalIgnoreCase)) { next = f; break; }
+                }
+                if (next == null) return null;
+                cur = next;
+            }
+            return cur;
+        }
+
+        // Move the email into the chosen folder (looked up from its display path).
         private void MoveTo(dynamic mail, string display)
         {
             try
             {
-                string eid;
-                if (_folderMap != null && _folderMap.TryGetValue(display, out eid))
-                {
-                    dynamic ns = ((dynamic)_app).GetNamespace("MAPI");
-                    dynamic dest = ns.GetFolderFromID(eid);
-                    if (dest != null) { mail.Move(dest); return; }
-                }
-                Ui.Notify("Folder not found: " + display, "Axon intelligence");
+                dynamic ns = ((dynamic)_app).GetNamespace("MAPI");
+                dynamic dest = ResolveFolder(ns, display);
+                if (dest != null) { mail.Move(dest); return; }
+                Ui.Notify("Folder not found: " + display + "\n\nIt may have been renamed or removed. "
+                          + "Settings > Learn my folders will refresh the list.", "Axon intelligence");
             }
             catch (Exception ex) { Ui.Notify("Couldn't move: " + ex.Message, "Axon intelligence"); }
         }
@@ -470,19 +653,21 @@ namespace Axon.OutlookAddin
             var ranked = new System.Collections.Generic.List<string>();
             try
             {
-                if (string.IsNullOrWhiteSpace(senderName) || _folderMap == null || _folderMap.Count == 0) return ranked;
+                var map = _folderMap; var prim = _primaryFolders;   // snapshot: a refresh may swap these
+                if (string.IsNullOrWhiteSpace(senderName) || map == null || map.Count == 0) return ranked;
                 dynamic ns = ((dynamic)_app).GetNamespace("MAPI");
                 string filter = "[SenderName] = '" + senderName.Replace("'", "''") + "'";
                 var counts = new System.Collections.Generic.Dictionary<string, int>();
                 int scanned = 0;
-                foreach (var kv in new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, string>>(_folderMap))
+                foreach (var kv in new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, string>>(map))
                 {
                     if (scanned >= 60) break;   // bound the scan
-                    if (!_primaryFolders.Contains(kv.Key)) continue;   // don't query other stores (slow)
+                    if (prim != null && !prim.Contains(kv.Key)) continue;   // don't query other stores (slow)
                     scanned++;
                     try
                     {
-                        dynamic f = ns.GetFolderFromID(kv.Value);
+                        dynamic f = ResolveFolder(ns, kv.Key);
+                        if (f == null) continue;
                         int c = 0; try { c = (int)f.Items.Restrict(filter).Count; } catch { }
                         if (c > 0) counts[kv.Key] = c;
                     }
@@ -523,12 +708,15 @@ namespace Axon.OutlookAddin
             foreach (var path in folders)
             {
                 sb.Append("- ").Append(path).Append("\n");
-                if (ns == null || sampled >= 40 || _folderMap == null || !_folderMap.ContainsKey(path)) continue;
-                if (!_primaryFolders.Contains(path)) continue;   // other stores: listed, not probed
+                var map = _folderMap; var prim = _primaryFolders;   // snapshot: a refresh may swap these
+                if (ns == null || sampled >= 40 || map == null || !map.ContainsKey(path)) continue;
+                if (prim != null && !prim.Contains(path)) continue;   // other stores: listed, not probed
                 sampled++;
                 try
                 {
-                    dynamic items = ns.GetFolderFromID(_folderMap[path]).Items;
+                    dynamic fld = ResolveFolder(ns, path);
+                    if (fld == null) continue;
+                    dynamic items = fld.Items;
                     try { items.Sort("[ReceivedTime]", true); } catch { }
                     var subs = new System.Collections.Generic.List<string>();
                     dynamic m = null; try { m = items.GetFirst(); } catch { }
@@ -616,7 +804,12 @@ namespace Axon.OutlookAddin
                 dynamic inbox = ns.GetDefaultFolder(6);
                 foreach (dynamic f in inbox.Folders)
                     if (string.Equals((string)f.Name, name, StringComparison.OrdinalIgnoreCase)) return f;
-                return inbox.Folders.Add(name);
+                dynamic made = inbox.Folders.Add(name);
+                // The cached list predates this folder — re-learn in the background so it is offered next
+                // time rather than only after the refresh that runs behind the following Move.
+                var t = new System.Threading.Thread(() => { try { EnumerateInboxFolders(); SaveFolderCache(); } catch { } });
+                t.IsBackground = true; t.Start();
+                return made;
             }
             catch (Exception ex) { Ui.Notify("Couldn't create folder: " + ex.Message, "Axon intelligence"); return null; }
         }
