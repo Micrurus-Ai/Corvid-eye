@@ -1082,9 +1082,85 @@ namespace Axon.OutlookAddin
         // learned tone, reminders and settings. %APPDATA%\AxonOutlook, which uninstall clears.
         internal static string AxonDataDir()
         {
+            string shared = SharedDataDir();
+            if (!string.IsNullOrEmpty(shared)) return shared;
+            return LocalDataDir();
+        }
+
+        private static string LocalDataDir()
+        {
             string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AxonOutlook");
             try { Directory.CreateDirectory(dir); } catch { }
             return dir;
+        }
+
+        // Resolved once per Outlook session. "" means "no usable shared location, stay local".
+        private static string _sharedDir;
+        private static bool _sharedChecked;
+
+        // IT can move everything a user learns off the PC and onto a share, by setting "data_dir" in the
+        // config.json beside the DLL. Environment variables are expanded, so one setting serves everyone:
+        //
+        //     "data_dir": "\\\\server\\share\\Axon\\%USERNAME%"
+        //
+        // The point is that the learning follows the person to any PC instead of being rebuilt on each one.
+        // It is checked ONCE per session and must be genuinely writable; if the share is missing or refuses
+        // a write, Axon silently uses the local profile for that session rather than failing every feature
+        // that wants to remember something. Existing local files are copied across the first time, so
+        // turning this on does not throw away what somebody has already learned.
+        private static string SharedDataDir()
+        {
+            if (_sharedChecked) return _sharedDir;
+            _sharedChecked = true;
+            _sharedDir = "";
+            try
+            {
+                string cfg = null;
+                try { cfg = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "config.json"); }
+                catch { }
+                string userCfg = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                                              "AxonOutlook", "config.json");
+                if (File.Exists(userCfg)) cfg = userCfg;   // a per-user config wins, same as the model settings
+                if (cfg == null || !File.Exists(cfg)) return _sharedDir;
+
+                var js = new System.Web.Script.Serialization.JavaScriptSerializer();
+                var d = js.DeserializeObject(File.ReadAllText(cfg)) as System.Collections.Generic.Dictionary<string, object>;
+                if (d == null || !d.ContainsKey("data_dir") || d["data_dir"] == null) return _sharedDir;
+                string path = Environment.ExpandEnvironmentVariables(d["data_dir"].ToString().Trim());
+                if (path.Length == 0) return _sharedDir;
+
+                Directory.CreateDirectory(path);
+                // Prove it, rather than trusting that the directory exists: a read-only share creates
+                // nothing and would leave every save silently failing later.
+                string probe = Path.Combine(path, ".axon-write-test");
+                File.WriteAllText(probe, "");
+                File.Delete(probe);
+
+                MigrateInto(path);
+                _sharedDir = path;
+            }
+            catch { _sharedDir = ""; }
+            return _sharedDir;
+        }
+
+        // First run against a shared location: bring across what this user already learned locally.
+        // Never overwrites a file that is already there, so the shared copy always wins.
+        private static void MigrateInto(string target)
+        {
+            try
+            {
+                string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AxonOutlook");
+                if (!Directory.Exists(local) || string.Equals(local.TrimEnd('\\'), target.TrimEnd('\\'),
+                                                              StringComparison.OrdinalIgnoreCase)) return;
+                foreach (var f in Directory.GetFiles(local))
+                {
+                    string name = Path.GetFileName(f);
+                    if (string.Equals(name, "config.json", StringComparison.OrdinalIgnoreCase)) continue;   // stays local
+                    string dest = Path.Combine(target, name);
+                    if (!File.Exists(dest)) File.Copy(f, dest);
+                }
+            }
+            catch { }
         }
 
         private System.Collections.Generic.List<string> LoadDownloadFolders()
